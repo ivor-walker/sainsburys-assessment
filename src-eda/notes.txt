@@ -1,0 +1,21 @@
+Join productdetails onto cataloguediscontinuation by productkey
+
+ProductKey - factor, interferes with iid
+Supplier - factor
+HierarchyLevel1 and 2 - factors, 2 is broader than 1. 1 for prediction and 2 for inference
+DIorDOM - recast to bool, affects ForecastPerWeek volatility so interact with ForecastPerWeek
+Seasonal - bool, affects ForecastPerWeek volatility so interact with ForecastPerWeek
+CatEdition - factor, interferes with iid
+SpringSummer - bool
+WeeksOut - ordinal factor
+Status - recast to bool
+SalesPerIncVAT - ordinal factor?
+ForecastPerWeek - float, predicted average weekly demand until new catalogue
+ActualsPerWeek - float, actual average weekly demand since new catalogue
+DiscontinuedTF - bool, target
+
+new RevenueForecastPerWeek - float, salesperincvat * forecastperweek
+new RevenueActualsPerWeek - float, salesperincvat * actualsperweek
+
+Inference model: Two-level hierarchical GLMm of CatEdition and ProductKey
+Prediction model: LightGBM
