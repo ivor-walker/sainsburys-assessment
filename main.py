@@ -2,8 +2,8 @@ from src.data.data_prep import prepare_data
 
 import eda.data_visualisation as data_viz
 
-from src.models.inference.base import InferenceModel
-from src.models.prediction.base import PredictionModel
+from src.models.inference.inference import InferenceModel
+from src.models.prediction.prediction import PredictionModel
 
 train_data, eval_data = prepare_data(
     product_details = "data/ProductDetails.csv",
@@ -16,16 +16,25 @@ inference_model = InferenceModel()
 prediction_model = PredictionModel();
 
 load_model = True
-for model in [inference_model, prediction_model]:
-    if load_model:
-        model.load(
-            model_path = "models/model.pkl",
-            data = train_data
-        )
-    else:
-        model.train(train_data) 
-        model.save()
+save_model = True
 
-    model.diagnose()
+for model in [inference_model, prediction_model]:
+    model_path = f"models/{model.get_model_name()}.model"
+
+    try:
+        if load_model == False:
+            raise Exception("Model loading disabled, training new model.")
+
+        model.load(model_path)
+    
+    except Exception as e:
+        print(str(e))
+
+        model.train(train_data) 
+
+        if save_model:
+            model.save()
+
+    model.diagnose(train_data)
 
     model.eval(eval_data)
