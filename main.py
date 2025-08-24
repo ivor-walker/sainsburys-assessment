@@ -2,8 +2,7 @@ from src.data.data_prep import prepare_data
 
 import eda.data_visualisation as data_viz
 
-from src.models.inference.inference import InferenceModel
-from src.models.prediction.prediction import PredictionModel
+from src.models.base import Model
 
 train_data, eval_data = prepare_data(
     product_details = "data/ProductDetails.csv",
@@ -12,8 +11,8 @@ train_data, eval_data = prepare_data(
 
 # data_viz.visualise_data(data)
 
-inference_model = InferenceModel()
-prediction_model = PredictionModel();
+inference_model = Model(model_type = "inference")
+prediction_model = Model(model_type = "prediction")
 
 load_model = True
 save_model = True

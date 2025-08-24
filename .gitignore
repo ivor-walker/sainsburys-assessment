@@ -1,2 +1,3 @@
 data/
 info/
+**/__pycache__/
