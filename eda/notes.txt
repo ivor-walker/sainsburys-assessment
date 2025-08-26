@@ -12,7 +12,7 @@ Status - recast to bool
 SalesPriceIncVAT - ordinal factor?
 ForecastPerWeek - float, predicted average weekly demand until new catalogue
 ActualsPerWeek - float, actual average weekly demand since new catalogue
-DiscontinuedTF - bool, target
+DiscontinuedTF - bool, target. Decision made at weeksout = 0.
 
 new RevenueForecastPerWeek - float, salesperincvat * forecastperweek
 new RevenueActualsPerWeek - float, salesperincvat * actualsperweek
