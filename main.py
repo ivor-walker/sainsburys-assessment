@@ -11,7 +11,12 @@ from src.models.base import Model
 train_data, eval_data = prepare_data(
     product_details = os.getenv("PRODUCT_DETAILS_LOCATION"),
     catalogue_discontinuation = os.getenv("CATALOGUE_DISCONTINUATION_LOCATION"),
+    load_processed_data = os.getenv("TRY_LOADING_PROCESSED_DATA", "False") == "True",
+    processed_data_loc = os.getenv("PROCESSED_DATA_LOCATION", "data/processed_data.parquet"),
+    save_processed_data = os.getenv("SAVE_PROCESSED_DATA", "False") == "True",
 )
+
+breakpoint()
 
 if os.getenv("SHOW_EDA", "False") == "True":
     print("Showing EDA visualisations.")
