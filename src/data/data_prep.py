@@ -5,36 +5,54 @@ Data preprocessing functions
 import polars as pl
 
 """
-Final pipeline to be imported by main
+Final pipeline to be imported by inference
 """
 def prepare_data(
-    product_details: str,
-    catalogue_discontinuation: str,
-    load_processed_data: bool,
-    train_data_loc: str,
-    eval_data_loc: str,
-    save_processed_data: bool,
-    scaling_info_loc: str,
     target_col: str = "discontinued",
     group_cols: list = ["product", "catalogue"],
+    sort_order: list = ["product", "catalogue", "weeks_out"],
+    use_training_info: bool = True,
+    **kwargs
 ) -> tuple:
+    
+    scaling_info = None
+    categorical_info = None
+    
+    if use_training_info:
+        try:
+            scaling_info = pl.read_parquet(kwargs["scaling_info_loc"])
+        except Exception as e:
+            print(str(e))
+            raise Exception("Scaling info failed to load - this file is required for performing inference on new data.")
 
+        try:
+            categorical_info = pl.read_parquet(kwargs["categorical_info_loc"])
+
+        except Exception as e:
+            print(str(e))
+            raise Exception("Categorical info failed to load - this file is required for performing inference on new data.")
+    
+    processed_data_loc = kwargs["processed_data_loc"]
+    load_processed_data = kwargs["load_processed_data"] 
+    
     try:
         if not load_processed_data:
             raise Exception("Loading processed data disabled in environment variables")
         
-        print("Loading processed data...")
-        train_data = pl.read_parquet(train_data_loc)
-        eval_data = pl.read_parquet(eval_data_loc)
-        scaling_info = pl.read_parquet(scaling_info_loc)
-
+        print("Loading processed data from disk...")
+        data = pl.read_parquet(processed_data_loc)
+        print("Processed data loaded successfully!")
+        
     except Exception as e:
         print(str(e))
-        print("Reading and processing data...")
+        load_processed_data = False
+        print("Reading and processing raw data...")
 
-        data = __read_data(product_details, catalogue_discontinuation) 
+        data = __read_data(kwargs["product_details"], kwargs["catalogue_discontinuation"]) 
 
-        data = __clean_data(data)
+        data = __clean_data(data, sort_order = sort_order)
+
+        data = __add_logs(data)
         
         # Add revenue as an interaction instead of in-data specifically, to avoid perfect collinearity with price and sales
         # data = __add_revenue(data)
@@ -49,7 +67,64 @@ def prepare_data(
         data = __add_product_dynamics(data)
         
         print("Product dynamics added, transforming for training...")
+        
+        if use_training_info:
+            __test_data(scaling_info, data_name = "scaling_info", index_cols = [])
+            data = __apply_scaling_info(data, scaling_info)
+
+            __test_data(categorical_info, data_name = "categorical_info", index_cols = [])
+            data = __apply_categorical_info(data, categorical_info)
+
         data = __transform_for_training(data, target_col = target_col, group_cols = group_cols)
+
+    finally:
+        print("Finalising processed data...")
+        __test_data(data, data_name = "processed_data", index_cols = sort_order)
+        
+        save_processed_data = kwargs["save_processed_data"]
+        if save_processed_data and not load_processed_data:
+            data.write_parquet(processed_data_loc)
+
+            print(f"Processed data saved to {processed_data_loc}") 
+        
+        if use_training_info:
+            target_col = f"{target_col}_target_bool"
+            data = __seperate_dependent_variable(data, target = target_col)
+
+        print("Data processing complete!")
+        return data, scaling_info
+
+"""
+Final pipeline to be used for training
+"""
+def prepare_training_data(
+    target_col: str = "discontinued",
+    group_cols: list = ["product", "catalogue"],
+    sort_order: list = ["product", "catalogue", "weeks_out"],
+    **kwargs,
+):
+    train_data_loc = kwargs["train_data_loc"]
+    eval_data_loc = kwargs["eval_data_loc"]
+    scaling_info_loc = kwargs["scaling_info_loc"]
+    
+    load_training_data = kwargs["load_training_data"]
+
+    try:
+        if not load_training_data:
+            raise Exception("Loading training data disabled in environment variables")
+        
+        print("Loading training data from disk...")
+        train_data = pl.read_parquet(train_data_loc)
+        eval_data = pl.read_parquet(eval_data_loc)
+        scaling_info = pl.read_parquet(scaling_info_loc)
+        print("Training data loaded successfully!")
+
+    except Exception as e:
+        print(str(e))
+        load_training_data = False
+        
+        print("Creating training data...")
+        data, scaling_info = prepare_data(**kwargs, use_training_info = False)
 
         train_data, eval_data = __train_eval_split(data)
         
@@ -59,29 +134,33 @@ def prepare_data(
         train_data = __apply_scaling(train_data, scaling_info)
         eval_data = __apply_scaling(eval_data, scaling_info)
         
-        train_data = __address_high_cardinality(train_data)
-        
-        print("Data processing complete!")
+        categorical_info = __get_categorical_info(train_data)
 
+        train_data = __apply_categorical_info(train_data, categorical_info)
+        eval_data = __apply_categorical_info(train_data, categorical_info)
+
+        # train_data = __address_high_cardinality(train_data)
+    
     finally:
+        print("Finalising training data...")
         # Update target and group col names after transform
-        index_cols = ["product_group", "catalogue_group", "weeks_out"]
+        sort_order = ["product_group", "catalogue_group", "weeks_out"]
 
-        __test_data(train_data, data_name = "train_data", group_cols = index_cols)
-        __test_data(eval_data, data_name = "eval_data", group_cols = index_cols)
+        __test_data(train_data, data_name = "train_data", index_cols = sort_order)
+        __test_data(eval_data, data_name = "eval_data", index_cols = sort_order)
         
-        __test_data(scaling_info, data_name = "scaling_info", group_cols = ["feature"])
-        
-        if save_processed_data and not load_processed_data:
+        if kwargs["save_training_data"] and not load_training_data:
             train_data.write_parquet(train_data_loc)
             eval_data.write_parquet(eval_data_loc)
             scaling_info.write_parquet(scaling_info_loc)
-            print(f"Processed data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
+            print(f"Training, eval and scaling data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
 
         target_col = f"{target_col}_target_bool"
         train_data = __seperate_dependent_variable(train_data, target = target_col) 
         eval_data = __seperate_dependent_variable(eval_data, target = target_col) 
+        print("Training data processing complete!")
         return train_data, eval_data, scaling_info
+
 
 """
 Read and combine ProductDetails and CatalogueDiscontinuation data
@@ -107,7 +186,8 @@ def __read_data(
 Clean data by recasting columns, renaming, etc
 """
 def __clean_data(
-    data: pl.DataFrame
+    data: pl.DataFrame,
+    sort_order: list,
 ) -> pl.DataFrame:
     data = data.select(
         # Recast ProductKey, CatEdition, Supplier, Hierarchy to categorical
@@ -142,7 +222,7 @@ def __clean_data(
     )
 
     # Return sorted by product, catalogue, weeks_out reversed (latest week first)
-    return data.sort(["product", "catalogue", "weeks_out"], descending = [False, False, True])
+    return data.sort(sort_order, descending = [False, False, True])
 
 """
 Add forecasted and actual revenue
@@ -158,6 +238,17 @@ def __add_revenue(
     )
 
 """
+Add logs of all numbers we want to divide by
+"""
+def __add_logs(
+    data: pl.DataFrame
+) -> pl.DataFrame:
+    return data.with_columns(
+        (pl.col("forecasted_remaining_sales_weekly") + 1).log().alias("log_forecasted_remaining_sales_weekly"), 
+        (pl.col("actual_completed_sales_weekly") + 1).log().alias("log_actual_completed_sales_weekly"),
+    )
+
+"""
 Add estimates of growth
 For a given decision point t, we have two datapoints: actual_completed, 0 to t - 1, and forecasted_remaining, t to n. Completed represents a single point estimate of the past, remaining represents a single point estimate of the future. 
 A naive estimate of growth is the ratio between future and past, or forecasted_remaining / actual_completed. Growth above 1 means the product is expected to grow, growth below 1 means the product is expected to shrink.
@@ -167,7 +258,7 @@ def __add_estimated_growth(
 ) -> pl.DataFrame:
     return data.with_columns(
         # Estimate of growth = future / past 
-        (pl.col("forecasted_remaining_sales_weekly") / pl.col("actual_completed_sales_weekly")).alias("estimated_growth_sales_weekly"),
+        (pl.col("log_forecasted_remaining_sales_weekly") - pl.col("log_actual_completed_sales_weekly")).alias("log_estimated_growth_sales_weekly"),
     )
 
 """
@@ -186,10 +277,12 @@ def __add_demand_dynamics(
         (
             pl.col("forecasted_remaining_sales_weekly").diff().over(group_cols).fill_null(0.0)
         ).alias("change_forecasted_remaining_sales_weekly"),
+ 
+        (
+            pl.col("log_estimated_growth_sales_weekly").diff().over(group_cols).fill_null(0.0)
+        ).alias("log_change_estimated_growth_sales_weekly"),
 
-        ( 
-            pl.col("estimated_growth_sales_weekly").diff().over(group_cols).fill_null(0.0)
-        ).alias("change_estimated_growth_sales_weekly"),
+        
     )
 
 """
@@ -287,7 +380,7 @@ def __add_easy_predictions(
 ) -> pl.DataFrame:
     force_false = (
         # Product has been around for a short time - always retain
-        (pl.col("total_runtime").le(min_catalogue_length))
+        (pl.col("weeks_in").le(min_catalogue_length))
     )
 
     force_true = (
@@ -337,8 +430,13 @@ def __add_sales_info(
     )
 
     product_run_info = product_run_info.with_columns(
+        # Log cumulative actual sales for safety of future divisions
+        (pl.col("cumsum_actual_completed_sales") + 1).log().alias("log_cumsum_actual_completed_sales"),
+    )
+
+    product_run_info = product_run_info.with_columns(
         # Average of cumulative actual sales so far
-        (pl.col("cumsum_actual_completed_sales") / pl.col("weeks_in")).alias("average_cumsum_actual_completed_sales"),
+        (pl.col("log_cumsum_actual_completed_sales") / pl.col("weeks_in")).alias("log_average_cumsum_actual_completed_sales"),
     )
 
     product_run_info = product_run_info.with_columns(
@@ -348,12 +446,12 @@ def __add_sales_info(
 
     product_run_info = product_run_info.with_columns(
         # Ratio between forecast and cumsum average: 
-        # As weeks_in approaches total_runtime, the cumsum dwarves the forecasted remaining and this approaches zero
-        (pl.col("forecasted_remaining_sales_weekly") / pl.col("average_cumsum_actual_completed_sales")).alias("ratio_forecast_cumsum_average"),
+        # As weeks_in approaches weeks_in, the cumsum dwarves the forecasted remaining and this approaches zero
+        (pl.col("log_forecasted_remaining_sales_weekly") - pl.col("log_average_cumsum_actual_completed_sales")).alias("ratio_log_forecast_log_cumsum_average_completed"),
     
         # Ratio between actual sales so far and expected total sales: how much of the expected sales have we already seen?
         # More complicated measure of how far through the product's run we are, but in sales terms rather than time terms
-        # As weeks_in approaches total_runtime, the cumsum dwarves the forecasted remaining and this goes from 0 (low cumulative sales : high expected sales because 1 week forecast is relatively high compared to 1 weeks cumulative sales) to 1 (cumulative sales begin to dwarf forecast, so denominator advantage becomes eroded)
+        # As weeks_in approaches weeks_in, the cumsum dwarves the forecasted remaining and this goes from 0 (low cumulative sales : high expected sales because 1 week forecast is relatively high compared to 1 weeks cumulative sales) to 1 (cumulative sales begin to dwarf forecast, so denominator advantage becomes eroded)
         (pl.col("cumsum_actual_completed_sales") / pl.col("expected_total_sales")).alias("proportion_expected_completed"),
     )
 
@@ -377,20 +475,16 @@ def __add_volatility_measures(
             pl.col("forecasted_remaining_sales_weekly").list.std().alias("std_forecasted_remaining_sales"),
         )
     
-    # Standard deviation relative to mean: coefficient of variation (cv)
+    # Standard deviation relative to mean (current value): coefficient of variation (cv)
     elif measure == "cv":
         product_run_info = product_run_info.with_columns(
-            (
-                (
-                    pl.col("forecasted_remaining_sales_weekly").list.std() / pl.col("forecasted_remaining_sales_weekly")
-                ).list.mean().fill_null(0.0).clip(0.0, volatility_cap)
-            ).alias("cv_forecasted_remaining_sales"),
+            pl.when(pl.col("forecasted_remaining_sales_weekly").list.mean() == 0).then(0.0).otherwise(
+                pl.col("forecasted_remaining_sales_weekly").list.std() / pl.col("forecasted_remaining_sales_weekly").list.mean()
+            ).fill_null(0.0).clip(0.0, volatility_cap).alias("cv_forecasted_remaining_sales"),
 
-            (
-                (
-                    pl.col("actual_completed_sales_weekly").list.std() / pl.col("actual_completed_sales_weekly")
-                ).list.mean().fill_null(0.0).clip(0.0, volatility_cap)
-            ).alias("cv_actual_completed_sales"),
+            pl.when(pl.col("actual_completed_sales_weekly").list.mean() == 0).then(0.0).otherwise( 
+                pl.col("actual_completed_sales_weekly").list.std() / pl.col("actual_completed_sales_weekly").list.mean()
+            ).fill_null(0.0).clip(0.0, volatility_cap).alias("cv_actual_completed_sales"),
         )
 
     else:
@@ -428,6 +522,14 @@ def __add_weekly_product_status(
         # Rate of flipping = number of flips / weeks_in
         (pl.col("n_product_out_flips") / pl.col("weeks_in")).alias("rate_product_out_flips"),
     )
+
+    # Add first week status (to explain to the model why zero STD/growth)
+    product_run_info = product_run_info.with_columns(
+        (
+            (pl.col("weeks_in") == 1).cast(pl.Boolean)
+        ).alias("first_week"),
+    ) 
+
     
     return product_run_info
 
@@ -464,7 +566,6 @@ def __add_weeks_out_info(
     ) -> pl.DataFrame:
         product_run_info = product_run_info.with_columns(
             # Number of weeks the product has run for
-            pl.col("weeks_out").list.len().alias("total_runtime"),
             pl.col("weeks_out").list[0].alias("start_runtime"),
             
             # Count number of missing weeks in product's runtime
@@ -504,7 +605,7 @@ def __train_eval_split(
     split_col: str = "catalogue_group",
     eval_data_size: float = 0.2
 ) -> tuple:
-
+    
     # Get eval catalogue IDs
     catalogues = data[split_col].unique().sort()
     n_eval_catalogues = round(len(catalogues) * eval_data_size)
@@ -634,6 +735,9 @@ def __transform_for_training(
 
     data = data.rename(data_rename_map)
 
+    # Convert categoricals to dummies
+    data = data.to_dummies()
+
     # Cast all booleans to 0/1 UInt8 integers
     data = data.with_columns(
         [
@@ -683,8 +787,24 @@ Apply scaling to numeric columns based on provided scaling info
 def __apply_scaling(
     data: pl.DataFrame,
     scaling_info: pl.DataFrame,
+    scaling_method: str = "z_score",
+    clipping: bool = True,
+    clip: tuple = (-6, 6)
 ) -> pl.DataFrame:
-    # TODO
+    for row in scaling_info.iter_rows(named = True):
+        feature_name = row["feature"]
+
+        if scaling_method == "z_score":
+            mean, std = row["mean_stat"], max(row["std_stat"], 1e-6)
+            
+            data[feature_name] = (data[feature_name] - mean) / std
+
+            if clipping:
+                data[feature_name] = data[feature_name].clip(clip[0], clip[1])
+            
+        else:
+            raise ValueError(f"Unknown scaling method: {scaling_method}")
+
     return data
 
 """
@@ -693,8 +813,19 @@ Undo scaling to numeric columns based on provided scaling info
 def undo_scaling(
     data: pl.DataFrame,
     scaling_info: pl.DataFrame,
+    scaling_method: str = "z_score",
 ) -> pl.DataFrame:
-    # TODO
+    for row in scaling_info.iter_rows(named = True):
+        feature_name = row["feature"]
+
+        if scaling_method == "z_score":
+            mean, std = row["mean_stat"], max(row["std_stat"], 1e-6)
+            
+            data[feature_name] = data[feature_name] * std + mean            
+
+        else:
+            raise ValueError(f"Unknown scaling method: {scaling_method}") 
+
     return data
 
 """
@@ -745,7 +876,7 @@ Basic tests on test/train to ensure they meet expectations
 def __test_data(
     data: pl.DataFrame,
     data_name: str,
-    group_cols: list,
+    index_cols: list,
 ):
     # Check if polars
     if not isinstance(data, pl.DataFrame):
@@ -754,42 +885,87 @@ def __test_data(
     # Check if empty
     if data.is_empty():
         raise ValueError(f"{data_name} is empty")
+    
+    # Check null rows
+    null_row_mask = pl.any_horizontal(
+        pl.all().is_null()
+    )
+    null_col_mask = lambda column, data_type: pl.col(column).is_null()
 
-    # Locate null rows
-    data_missing = data.filter(
-        pl.any_horizontal(
-            pl.all().is_null()
-        )
+    __check_data_error(data, data_name, index_cols,
+        issue_name = "missing/NaN data",
+        issue_row_mask = null_row_mask,
+        issue_col_mask = null_col_mask,
     )
 
-    if not data_missing.is_empty():
-        __raise_data_error(data_missing)
-
-"""
-Raise data error with details of null rows
-"""
-def __raise_data_error(
-    data_missing: pl.DataFrame,
-):
-    # For each null row, get which columns are null
-    data_missing = data_missing.with_columns( 
-        cols_with_missing = pl.concat_list(
+    # Locate any infinities
+    # Get which columns are floats (valid to check for is_infinite())
+    float_cols = [column for column, data_type in data.schema.items() if data_type in pl.FLOAT_DTYPES]
+    
+    if float_cols:
+        # Check only valid float columns for is_infinite (can't catch exceptions as TODO)
+        inf_row_mask = pl.any_horizontal(
             *[
-                pl.when(
-                    pl.col(col).is_null()
-                ).then(pl.lit(col)).otherwise(pl.lit(None))
-            for col in data.columns]
-        ).alias("cols_with_missing")
+                pl.col(col).is_infinite()
+            for col in float_cols]
+        )
+        inf_col_mask = lambda column, data_type: pl.col(column).is_infinite() if data_type in pl.FLOAT_DTYPES else pl.lit(False)
+
+        __check_data_error(data, data_name, index_cols,
+            issue_name = "infinite data",
+            issue_row_mask = inf_row_mask,
+            issue_col_mask = inf_col_mask,
+        )
+
+        # Check if NaN
+        nan_row_mask = pl.any_horizontal(
+            *[
+                pl.col(col).is_nan()
+            for col in float_cols]
+        )
+
+        nan_col_mask = lambda column, data_type: pl.col(column).is_nan() if data_type in pl.FLOAT_DTYPES else pl.lit(False)
+
+        __check_data_error(data, data_name, index_cols,
+            issue_name = "NaN data",
+            issue_row_mask = nan_row_mask,
+            issue_col_mask = nan_col_mask,
+        )
+
+"""
+Check if/where a particular error condition is matched and raise accordingly
+"""
+def __check_data_error(
+    data: pl.DataFrame,
+    data_name: str,
+    index_cols: list,
+    issue_name: str,
+    issue_row_mask: pl.Expr,
+    issue_col_mask,
+):
+    problem_data = data.filter(
+        issue_row_mask
     )
 
-    # Get identifying info for each missing row
-    identifying_info = data_missing.select(
-        pl.col(group_cols).cast(pl.Utf8)
-        ).sort(group_cols[::-1])
+    n_problem = problem_data.height
+    if n_problem == 0:
+        return
 
-    n_missing = data_missing.height
-    missing_cols = data_missing.select(
-        pl.col("cols_with_missing").explode().unique().drop_nulls()
-    ).to_series().to_list()
+    # Get which columns are causing the problem
+    per_col_flags = data.select(
+        [
+            issue_col_mask(col, data_type).any().alias(col)
+        for col, data_type in data.schema.items()]
+    )
 
-    raise ValueError(f"{data_name} has {n_missing} rows with missing values \n\n Columns containing NaN/null: {missing_cols} \n\n Row indexes containin NaN/null: {identifying_info}")
+    # Isolate problem columns from rest of dataframe
+    problem_cols = per_col_flags.melt(
+        variable_name = "column", value_name = "has_issue"
+    ).filter(
+        pl.col("has_issue")
+    ).get_column("column").to_list()
+    
+    # Get unique info on each problem row
+    identifying_info = problem_data.select(pl.col(index_cols)).sort(index_cols, descending = [False, False, True])
+        
+    raise ValueError(f"{data_name} has {n_problem} rows with {issue_name} \n\n Columns with issue: {problem_cols} \n\n Rows with issue: {identifying_info}")
