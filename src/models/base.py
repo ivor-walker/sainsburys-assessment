@@ -1,8 +1,8 @@
 """
 Model - sets encapsulated model, and provides generic public methods to interact with the encapsulated model
 """
-from src.models.inference.glmm import GLMm
-from src.models.prediction.lightgbm import LightGBM
+from src.models.glmm import GLMm
+from src.models.lightgbm import LightGBM
 
 class Model:
     """

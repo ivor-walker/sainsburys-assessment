@@ -11,24 +11,32 @@ def prepare_data(
     product_details: str,
     catalogue_discontinuation: str,
     load_processed_data: bool,
-    processed_data_loc: str,
+    train_data_loc: str,
+    eval_data_loc: str,
     save_processed_data: bool,
+    scaling_info_loc: str,
+    target_col: str = "discontinued",
+    group_cols: list = ["product", "catalogue"],
 ) -> tuple:
 
     try:
         if not load_processed_data:
             raise Exception("Loading processed data disabled in environment variables")
-
-        data = pl.read_parquet(processed_data_loc)
+        
+        print("Loading processed data...")
+        train_data = pl.read_parquet(train_data_loc)
+        eval_data = pl.read_parquet(eval_data_loc)
+        scaling_info = pl.read_parquet(scaling_info_loc)
 
     except Exception as e:
         print(str(e))
+        print("Reading and processing data...")
 
         data = __read_data(product_details, catalogue_discontinuation) 
 
         data = __clean_data(data)
         
-        # Add revenue as an interaction instead to avoid perfect collinearity with price and sales
+        # Add revenue as an interaction instead of in-data specifically, to avoid perfect collinearity with price and sales
         # data = __add_revenue(data)
         
         data = __add_estimated_growth(data)
@@ -36,14 +44,44 @@ def prepare_data(
         data = __add_demand_dynamics(data)
 
         data = __add_previous_run_info(data)
-
+        
+        print("Adding product dynamics - this may take a while...")
         data = __add_product_dynamics(data)
+        
+        print("Transforming for training...")
+        data = __transform_for_training(data, target_col = target_col, group_cols = group_cols)
+
+        train_data, eval_data = __train_eval_split(data)
+        
+        # Get scaling info from train_dataing data, and apply to both train_data and eval_data
+        scaling_info = __get_scaling_info(train_data)
+        
+        train_data = __apply_scaling(train_data, scaling_info)
+        eval_data = __apply_scaling(eval_data, scaling_info)
+        
+        train_data = __address_high_cardinality(train_data)
+        
+        print("Data processing complete")
 
         if save_processed_data:
-            data.write_parquet(processed_data_loc)
+            train_data.write_parquet(train_data_loc)
+            eval_data.write_parquet(eval_data_loc)
+            scaling_info.write_parquet(scaling_info_loc)
+            print(f"Processed data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
 
     finally:
-        return __train_test_split(data)
+        # Update target and group col names after transform
+        index_cols = ["product_group", "catalogue_group", "weeks_out"]
+
+        __test_data(train_data, data_name = "train_data", group_cols = index_cols)
+        __test_data(eval_data, data_name = "eval_data", group_cols = index_cols)
+        
+        __test_data(scaling_info, data_name = "scaling_info", group_cols = ["feature"])
+
+        target_col = f"{target_col}_target"
+        train_data = __seperate_dependent_variable(train_data, target = target_col) 
+        eval_data = __seperate_dependent_variable(eval_data, target = target_col) 
+        return train_data, eval_data, scaling_info
 
 """
 Read and combine ProductDetails and CatalogueDiscontinuation data
@@ -171,46 +209,183 @@ def __add_product_dynamics(
     # Create rolling window - O(n * m * k) where m = start_runtime - weeks_out and k = number of columns to cumulate, extremely expensive!!
     cum_cols = ["range_out_weekly", "weeks_out", "actual_completed_sales_weekly", "forecasted_remaining_sales_weekly"]
     cum_agg_data = get_product_cum_aggregate(data, cum_cols = cum_cols)
-
+    
     # Add product status info
-    product_run_info = cum_agg_data.with_columns(
-        # Get all times the product status has "flipped"
-        pl.col("range_out_weekly").list.eval(
-            (
-                (pl.element() != pl.element().shift(-1)).fill_null(False)
-            ).cast(pl.UInt8)
-        ).alias("product_out_flips"),
-
-        # Starting status
-        pl.col("range_out_weekly").list[0].alias("first_product_range_out"),    )
-     
-    # Add product flip info
-    product_run_info = product_run_info.with_columns(
-        # How many times has the product's range out status changed
-        pl.col("product_out_flips").list.sum().alias("n_product_out_flips"),
-
-    )
+    product_run_info = __add_product_status_info(cum_agg_data)
     
     # Add weeks_out info
-    product_run_info = product_run_info.with_columns(
-        # Number of weeks the product has run for
-        pl.col("weeks_out").list.len().alias("total_runtime"),
-        pl.col("weeks_out").list[0].alias("start_runtime"),
-        
-        # Count number of missing weeks in product's runtime
-        pl.col("weeks_out").list.eval(
-            (pl.element() - pl.element().shift(-1)).cast(pl.UInt8) != 1
-        ).list.sum().alias("n_missing_runtimes"),
+    product_run_info = __add_weeks_out_info(product_run_info)
+    
+    # Add product status features, dependent on weeks_out
+    product_run_info = __add_weekly_product_status(product_run_info)
 
-        # Restore weeks_out to be a single value (latest week only)
-        pl.col("weeks_out").list[-1].alias("weeks_out"),
+    # Drop list of flips once they become unecessary
+    product_run_info = product_run_info.drop("product_out_flips")
+    
+    # Add volatility measures
+    product_run_info = __add_volatility_measures(product_run_info)
+
+    # Reset forecasts from list to single latest value
+    product_run_info = product_run_info.with_columns(
+        pl.col("forecasted_remaining_sales_weekly").list[-1].alias("forecasted_remaining_sales_weekly"),
     )
     
-    # Get reversed weeks_out - how many weeks the product has been running for up to the current week
-    product_run_info = product_run_info.with_columns(
-        (pl.col("start_runtime") - pl.col("weeks_out") + 1).alias("weeks_in"),
+    # Add actual/forecasted sales info that can be used to infer how long the product will run for
+    product_run_info = __add_sales_info(product_run_info)
+
+    # Add rules-based predictions for easy cases 
+    if easy_predictions:
+        product_run_info = __add_easy_predictions(product_run_info)
+
+    # Check accuracy of easy predictions
+    if easy_predictions and easy_prediction_accuracy:
+        product_run_info = __check_accuracy_easy_predictions(product_run_info) 
+
+    # Join this extra product info onto original weekly data
+    on_cols = ["product", "catalogue", "weeks_out"]
+    drop_cols = [col for col in product_run_info.columns if col in data.columns and col not in on_cols]
+    return data.join(
+        product_run_info.drop(drop_cols),
+        on = on_cols,
+        how = "left",
+        validate = "1:1",
     )
 
+"""
+Check accuracy of easy predictions
+"""
+def __check_accuracy_easy_predictions(
+    product_run_info: pl.DataFrame
+) -> pl.DataFrame:
+    product_run_info = product_run_info.with_columns(
+        (
+            # Equals predicted value
+            (pl.col("easy_pred_discontinue") == pl.col("discontinued")) |
+            
+            # Or no prediction made
+            (pl.col("easy_pred_discontinue").is_null())
+
+        ).alias("accuracy")
+    )
+
+    return product_run_info
+
+"""
+Add rules-based predictions for easy cases
+"""
+def __add_easy_predictions(
+    data: pl.DataFrame,
+) -> pl.DataFrame:
+    force_false = (
+        # Product has been around for a short time - always retain
+        (pl.col("total_runtime").le(min_catalogue_length))
+    )
+
+    force_true = (
+        # Product does not run to end of catalogue - always discontinue
+        # Cannot be known in advance though
+        # (pl.col("end_runtime") != final_week) |
+
+        # Non-continuous run - always discontinue
+        (pl.col("n_missing_runtimes") != 0)
+    )
+
+    force_unknown = (
+        # Product appears in a previous catalogue - goto ML
+        (pl.col("catalogue_count") > 0) |
+        
+        # If product isn't consistently one status - goto ML
+        (pl.col("n_product_out_flips") != 0)
+    )
+
+    product_run_info = product_run_info.with_columns(
+        pl.when(
+            force_unknown
+        ).then(
+            pl.lit(None)
+        ).when(
+            force_true | pl.col("first_product_range_out")
+        ).then(
+            pl.lit(True)
+        ).when(
+            force_false | ~pl.col("first_product_range_out")
+        ).then(
+            pl.lit(False)
+        ).alias("easy_pred_discontinue")
+    )
+
+    return product_run_info
+
+"""
+Add sales info that can be used to infer how long the product will run for
+"""
+def __add_sales_info(
+    product_run_info: pl.DataFrame
+) -> pl.DataFrame:
+    product_run_info = product_run_info.with_columns(
+        # Cumulative actual sales so far
+        (pl.col("actual_completed_sales_weekly").list.sum()).alias("cumsum_actual_completed_sales"),
+    )
+
+    product_run_info = product_run_info.with_columns(
+        # Average of cumulative actual sales so far
+        (pl.col("cumsum_actual_completed_sales") / pl.col("weeks_in")).alias("average_cumsum_actual_completed_sales"),
+    )
+
+    product_run_info = product_run_info.with_columns(
+        # Actual sales so far plus forecasted sales
+        (pl.col("cumsum_actual_completed_sales") + pl.col("forecasted_remaining_sales_weekly")).alias("expected_total_sales"),
+    )
+
+    product_run_info = product_run_info.with_columns(
+        # Ratio between forecast and cumsum average: 
+        # As weeks_in approaches total_runtime, the cumsum dwarves the forecasted remaining and this approaches zero
+        (pl.col("forecasted_remaining_sales_weekly") / pl.col("average_cumsum_actual_completed_sales")).alias("ratio_forecast_cumsum_average"),
+    
+        # Ratio between actual sales so far and expected total sales: how much of the expected sales have we already seen?
+        # More complicated measure of how far through the product's run we are, but in sales terms rather than time terms
+        # As weeks_in approaches total_runtime, the cumsum dwarves the forecasted remaining and this goes from 0 (low cumulative sales : high expected sales because 1 week forecast is relatively high compared to 1 weeks cumulative sales) to 1 (cumulative sales begin to dwarf forecast, so denominator advantage becomes eroded)
+        (pl.col("cumsum_actual_completed_sales") / pl.col("expected_total_sales")).alias("proportion_expected_completed"),
+    )
+
+    return product_run_info
+
+"""
+Add volatility measures based on forecasted and actual sales history
+"""
+def __add_volatility_measures(
+        product_run_info: pl.DataFrame,
+        measure: str = "cv",
+    ) -> pl.DataFrame:
+        if measure == "std":
+            product_run_info = product_run_info.with_columns(
+                # Volatility of actual sales so far
+                pl.col("actual_completed_sales_weekly").list.std().alias("std_actual_completed_sales"),
+
+                # Volatility of forecasted sales so far
+                pl.col("forecasted_remaining_sales_weekly").list.std().alias("std_forecasted_remaining_sales"),
+            )
+        
+        elif measure == "cv":
+            product_run_info = product_run_info.with_columns(
+                # Standard deviation relative to mean: coefficient of variation (cv)
+                (pl.col("forecasted_remaining_sales_weekly").list.std() / pl.col("forecasted_remaining_sales_weekly").list.mean()).alias("cv_forecasted_remaining_sales"),
+                (pl.col("actual_completed_sales_weekly").list.std() / pl.col("actual_completed_sales_weekly").list.mean()).alias("cv_actual_completed_sales"),
+            )
+
+        else:
+            raise ValueError(f"Unknown volatility measure: {measure}")
+        
+        
+
+        return product_run_info
+
+"""
+Add product status features that are dependent on weeks_out features - how long since the product's range_out status last changed, and how many times it has changed
+"""
+def __add_weekly_product_status(
+    product_run_info: pl.DataFrame
+) -> pl.DataFrame:
     product_run_info = product_run_info.with_columns(
         pl.when(
             pl.col("n_product_out_flips") > 0
@@ -230,125 +405,66 @@ def __add_product_dynamics(
         (pl.col("weeks_out").cast(pl.Int8) - pl.col("last_product_out_flip_time").cast(pl.Int8)).abs().alias("weeks_since_last_product_out_flip"),
     )
 
-    # Drop list of flips once they become unecessary
-    product_run_info = product_run_info.drop("product_out_flips")
-    
     # Add rate of flipping
     product_run_info = product_run_info.with_columns(
         # Rate of flipping = number of flips / weeks_in
         (pl.col("n_product_out_flips") / pl.col("weeks_in")).alias("rate_product_out_flips"),
     )
     
-    # Add actual/forecasted sales info that can be used to infer how long the product will run for
-    product_run_info = product_run_info.with_columns(
-        # Cumulative actual sales so far
-        (pl.col("actual_completed_sales_weekly").list.sum()).alias("cumsum_actual_completed_sales"),
-    )
+    return product_run_info
 
-    product_run_info = product_run_info.with_columns(
-        # Average of cumulative actual sales so far
-        (pl.col("cumsum_actual_completed_sales") / pl.col("weeks_in")).alias("average_cumsum_actual_completed_sales"),
-    )
-    
-    # Add volatility measures
-    product_run_info = product_run_info.with_columns(
-        # Volatility of actual sales so far
-        pl.col("actual_completed_sales_weekly").list.std().alias("std_actual_completed_sales"),
+"""
+Add initial info on how the product's range_out status has changed over time
+"""
+def __add_product_status_info(
+        cum_agg_data: pl.DataFrame
+    ) -> pl.DataFrame:
+        product_run_info = cum_agg_data.with_columns(
+            # Get all times the product status has "flipped"
+            pl.col("range_out_weekly").list.eval(
+                (
+                    (pl.element() != pl.element().shift(-1)).fill_null(False)
+                ).cast(pl.UInt8)
+            ).alias("product_out_flips"),
 
-        # Volatility of forecasted sales so far
-        pl.col("forecasted_remaining_sales_weekly").list.std().alias("std_forecasted_remaining_sales"),
-    )
-    
-    product_run_info = product_run_info.with_columns(
-        # Standard deviation relative to mean: coefficient of variation (cv)
-        (pl.col("std_actual_completed_sales") / (pl.col("average_cumsum_actual_completed_sales"))).alias("cv_actual_completed_sales"),
-        (pl.col("std_forecasted_remaining_sales") / (pl.col("average_cumsum_actual_completed_sales"))).alias("cv_forecasted_remaining_sales"),
-    )
-    
-    # Reset forecasts to a point estimate
-    product_run_info = product_run_info.with_columns(
-        pl.col("forecasted_remaining_sales_weekly").list[-1].alias("forecasted_remaining_sales_weekly"),
-    )
-
-    product_run_info = product_run_info.with_columns(
-        # Actual sales so far plus forecasted sales
-        (pl.col("cumsum_actual_completed_sales") + pl.col("forecasted_remaining_sales_weekly")).alias("expected_total_sales"),
-    )
-
-    product_run_info = product_run_info.with_columns(
-        # Ratio between forecast and cumsum average: 
-        # As weeks_in approaches total_runtime, the cumsum dwarves the forecasted remaining and this approaches zero
-        (pl.col("forecasted_remaining_sales_weekly") / pl.col("average_cumsum_actual_completed_sales")).alias("ratio_forecast_cumsum_average"),
-
-        # Ratio between actual sales so far and expected total sales: how much of the expected sales have we already seen?
-        # More complicated measure of how far through the product's run we are, but in sales terms rather than time terms
-        # As weeks_in approaches total_runtime, the cumsum dwarves the forecasted remaining and this goes from 0 (low cumulative sales : high expected sales because 1 week forecast is relatively high compared to 1 weeks cumulative sales) to 1 (cumulative sales begin to dwarf forecast, so denominator advantage becomes eroded)
-        (pl.col("cumsum_actual_completed_sales") / pl.col("expected_total_sales")).alias("proportion_expected_completed"),
-
-    )
-    
-    
-    
-    if easy_predictions:
-        force_false = (
-            # Product has been around for a short time - always retain
-            (pl.col("total_runtime").le(min_catalogue_length))
+            # Starting status
+            pl.col("range_out_weekly").list[0].alias("first_product_range_out"),    )
+        
+        # Add product flip info
+        product_run_info = product_run_info.with_columns(
+            # How many times has the product's range out status changed
+            pl.col("product_out_flips").list.sum().alias("n_product_out_flips"),
         )
 
-        force_true = (
-            # Product does not run to end of catalogue - always discontinue
-            # Cannot be known in advance though
-            # (pl.col("end_runtime") != final_week) |
+        return product_run_info
 
-            # Non-continuous run - always discontinue
-            (pl.col("n_missing_runtimes") != 0)
-        )
-
-        force_unknown = (
-            # Product appears in a previous catalogue - goto ML
-            (pl.col("catalogue_count") > 0) |
+"""
+Add initial info on the product's weeks_out history - how long the product has been running for, whether it has a continuous run, etc
+"""
+def __add_weeks_out_info(
+        product_run_info: pl.DataFrame
+    ) -> pl.DataFrame:
+        product_run_info = product_run_info.with_columns(
+            # Number of weeks the product has run for
+            pl.col("weeks_out").list.len().alias("total_runtime"),
+            pl.col("weeks_out").list[0].alias("start_runtime"),
             
-            # If product isn't consistently one status - goto ML
-            (pl.col("n_product_out_flips") != 0)
-        )
+            # Count number of missing weeks in product's runtime
+            pl.col("weeks_out").list.eval(
+                (pl.element() - pl.element().shift(-1)).cast(pl.UInt8) != 1
+            ).list.sum().alias("n_missing_runtimes"),
 
+            # Restore weeks_out to be a single value (latest week only)
+            pl.col("weeks_out").list[-1].alias("weeks_out"),
+        )
+        
+        # Get reversed weeks_out - how many weeks the product has been running for up to the current week
         product_run_info = product_run_info.with_columns(
-            pl.when(
-                force_unknown
-            ).then(
-                pl.lit(None)
-            ).when(
-                force_true | pl.col("first_product_range_out")
-            ).then(
-                pl.lit(True)
-            ).when(
-                force_false | ~pl.col("first_product_range_out")
-            ).then(
-                pl.lit(False)
-            ).alias("easy_pred_discontinue")
+            (pl.col("start_runtime") - pl.col("weeks_out") + 1).alias("weeks_in"),
         )
 
-    # Check accuracy of easy predictions
-    if easy_predictions and easy_prediction_accuracy:
-        product_run_info = product_run_info.with_columns(
-            (
-                # Equals predicted value
-                (pl.col("easy_pred_discontinue") == pl.col("discontinued")) |
+        return product_run_info
 
-                (pl.col("easy_pred_discontinue").is_null())
-
-            ).alias("accuracy")
-        )
-
-    # Join this extra product info onto original weekly data
-    on_cols = ["product", "catalogue", "weeks_out"]
-    drop_cols = [col for col in product_run_info.columns if col in data.columns and col not in on_cols]
-    return data.join(
-        product_run_info.drop(drop_cols),
-        on = on_cols,
-        how = "left",
-        validate = "1:1",
-    )
 
 """
 Add info on previous appearances of the product in earlier catalogues as this affects discontinuation status - products that have appeared in many previous catalogues but have consistent non-discontinued status can be discontinued
@@ -362,29 +478,34 @@ def __add_previous_run_info(
     )
 
 """
-Split data into ((train_X, train_y), (test_X, test_y))
-Because we're predicting for an unseen product in an unseen catalogue, we withhold 20% of newest catalogues for testing
+Split data into train_data and eval_data sets
+Because we're predicting for an unseen product in an unseen catalogue, we withhold 20% of newest catalogues for eval 
 """
-def __train_test_split(
+def __train_eval_split(
     data: pl.DataFrame,
-    test_size: float = 0.2
+    split_col: str = "catalogue_group",
+    eval_data_size: float = 0.2
 ) -> tuple:
-    # Get testing catalogue IDs
-    catalogues = data["catalogue"].unique().sort()
-    n_test_catalogues = round(len(catalogues) * test_size)
-    test_catalogues = catalogues.tail(n_test_catalogues)
 
-    # Split data into train and test sets
-    train_data = data.filter(~pl.col("catalogue").is_in(test_catalogues))
-    test_data = data.filter(pl.col("catalogue").is_in(test_catalogues))
+    # Get eval catalogue IDs
+    catalogues = data[split_col].unique().sort()
+    n_eval_catalogues = round(len(catalogues) * eval_data_size)
+    eval_catalogues = catalogues.tail(n_eval_catalogues)
 
-    # Split into X and y
-    train_X = train_data.drop("discontinued")
-    train_y = train_data["discontinued"]
-    test_X = test_data.drop("discontinued")
-    test_y = test_data["discontinued"]
+    # Split data into train_data and eval_data sets
+    train_data = data.filter(~pl.col(split_col).is_in(eval_catalogues))
+    eval_data = data.filter(pl.col(split_col).is_in(eval_catalogues))
 
-    return (train_X, train_y), (test_X, test_y)
+    return train_data, eval_data
+
+"""
+Separate dependent variable from features
+"""
+def __seperate_dependent_variable(
+    data: pl.DataFrame,
+    target: str,
+) -> tuple:
+    return data.drop(target), data.select(pl.col(target))
 
 """
 Select n random products, with a balance of discontinued and not discontinued
@@ -451,7 +572,7 @@ def get_product_cum_aggregate(
     by_week_columns = [col_name for col_name in data.columns if "week" in col_name and col_name not in cum_cols]
     product_columns = [col_name for col_name in data.columns if col_name not in by_week_columns and col_name not in cum_cols]
 
-	# Per-product 0-based index 
+    # Per-product 0-based index 
     frame = data.with_columns(
         idx = (pl.col(order_col).cum_count().over(product_columns) - 1).cast(pl.Int32) 
     )
@@ -472,3 +593,180 @@ def get_product_cum_aggregate(
     )
 
     return frame.select([*product_columns, *by_week_columns, *cum_cols])
+
+"""
+Prepare data in train_dataing format - converting booleans, etc
+"""
+def __transform_for_training(
+    data: pl.DataFrame,
+    target_col: str,
+    group_cols: list,
+):
+    # Make clear which columns aren't features
+    data_rename_map = {
+        target_col: f"{target_col}_target",
+    }
+    
+    [data_rename_map.update({col: f"{col}_group"}) for col in group_cols]
+
+    data = data.rename(data_rename_map)
+
+    # Cast all booleans to 0/1 UInt8 integers
+    bool_cols = [col for col in data.columns if data[col].dtype == pl.Boolean]
+    data = data.with_columns(
+        [
+            pl.col(col).cast(pl.UInt8).alias(f"{col}_bool")
+        for col in bool_cols]
+    )
+
+    return data
+
+"""
+Get scaling info from training data - min, max, mean, std for each numeric column
+"""
+def __get_scaling_info(
+    data: pl.DataFrame,
+    stats: list = ["min", "max", "mean", "std"],
+) -> pl.DataFrame:
+
+    num_cols = [col for col in data.columns if data[col].dtype.is_numeric() and "group" not in col and "target" not in col and "bool" not in col]
+
+    # Compute summary statistics
+    scaling_info = data.select(
+        # Remove non-numeric columns
+        [pl.col(c).alias(c) for c in num_cols]
+    ).melt(
+        # "Melt" dataframe to long format - one row per variable per observation
+        variable_name="feature", value_name="value"
+    ).group_by(
+        # Group by feature to produce list of values per feature
+        "feature"
+    ).agg(
+        # Aggregate to multiple columns for summary statistics
+        min_stat = pl.col("value").min(),
+        max_stat = pl.col("value").max(),
+        mean_stat = pl.col("value").mean(),
+        std_stat = pl.col("value").std(),     
+    ).sort(
+        # Sort by feature name to guarantee repeatability
+        "feature"
+    )
+
+    return scaling_info 
+    
+"""
+Apply scaling to numeric columns based on provided scaling info
+"""
+def __apply_scaling(
+    data: pl.DataFrame,
+    scaling_info: pl.DataFrame,
+) -> pl.DataFrame:
+    # TODO
+    return data
+
+"""
+Undo scaling to numeric columns based on provided scaling info
+"""
+def undo_scaling(
+    data: pl.DataFrame,
+    scaling_info: pl.DataFrame,
+) -> pl.DataFrame:
+    # TODO
+    return data
+
+"""
+Low frequency categorical variables can cause data leakage, e.g. if a product appears once and its supplier is unique to it, the model can learn to associate that supplier with discontinuation
+To avoid data leakage and reduce cardinality in categorical columns, form distribution of counts and categorical values, and only keep 95% of rows and bin the rest as 'other/unknown'
+"""
+
+def __address_high_cardinality(
+    data: pl.DataFrame,
+    small_supplier_threshold: float = 0.05,
+    other_unknown_label: str = "other_unknown",
+) -> pl.DataFrame:
+    
+    # Do not perform this process on grouping cols
+    cat_cols = [col for col in data.columns if data[col].dtype == pl.Categorical and "group" not in col and "target" not in col]
+    
+    for col in cat_cols:
+        value_counts = data[col].value_counts().sort("count", descending = True)
+        total_count = value_counts["count"].sum()
+        value_counts = value_counts.with_columns(
+            (pl.col("count") / total_count).alias("proportion")
+        )
+
+        # Take cumulative sum of proportions, from highest to lowest
+        value_counts = value_counts.with_columns(
+            pl.col("proportion").cum_sum().alias("cumulative_proportion")
+        )
+
+        # Keep right hand side of values distribution - i.e. those that make up (1 - m)% of data
+        values_to_keep = value_counts.filter(pl.col("cumulative_proportion") <= (1 - small_supplier_threshold))[col].to_list()
+        
+        # Replace values not in values_to_keep with other_unknown_label
+        keep_category = pl.col(col).cast(pl.Utf8).is_in(values_to_keep)
+
+        data = data.with_columns(
+            pl.when(keep_category)
+              .then(pl.col(col))
+              .otherwise(pl.lit(other_unknown_label))
+              .cast(pl.Categorical)
+              .alias(col)
+        )
+
+    return data
+
+"""
+Basic tests on test/train to ensure they meet expectations
+"""
+def __test_data(
+    data: pl.DataFrame,
+    data_name: str,
+    group_cols: list,
+):
+    # Check if polars
+    if not isinstance(data, pl.DataFrame):
+        raise ValueError(f"{data_name} is not a polars DataFrame")
+
+    # Check if empty
+    if data.is_empty():
+        raise ValueError(f"{data_name} is empty")
+
+    # Locate null rows
+    data_missing = data.filter(
+        pl.any_horizontal(
+            pl.all().is_null()
+        )
+    )
+
+    if not data_missing.is_empty():
+        # For each null row, get which columns are null
+        data_missing = data_missing.with_columns( 
+            cols_with_missing = pl.concat_list(
+                *[
+                    pl.when(
+                        pl.col(col).is_null()
+                    ).then(pl.lit(col)).otherwise(pl.lit(None))
+                for col in data.columns]
+            ).alias("cols_with_missing")
+        )
+
+        # Get identifying info for each missing row
+        identifying_info = data_missing.select(
+            pl.col(group_cols).cast(pl.Utf8)
+            ).sort(group_cols[::-1])
+
+        n_missing = data_missing.height
+        missing_cols = data_missing.select(
+            pl.col("cols_with_missing").explode().unique().drop_nulls()
+        ).to_series().to_list()
+
+        raise ValueError(f"{data_name} has {n_missing} rows with missing values \n\n Columns containing NaN/null: {missing_cols} \n\n Row indexes containin NaN/null: {identifying_info}")
+
+
+
+
+
+
+
+

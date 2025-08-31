@@ -8,12 +8,14 @@ import eda.data_vis as data_vis
 
 from src.models.base import Model
 
-train_data, eval_data = prepare_data(
+train_data, eval_data, scaling_info = prepare_data(
     product_details = os.getenv("PRODUCT_DETAILS_LOCATION"),
     catalogue_discontinuation = os.getenv("CATALOGUE_DISCONTINUATION_LOCATION"),
     load_processed_data = os.getenv("TRY_LOADING_PROCESSED_DATA", "False") == "True",
-    processed_data_loc = os.getenv("PROCESSED_DATA_LOCATION", "data/processed_data.parquet"),
-    save_processed_data = os.getenv("SAVE_PROCESSED_DATA", "False") == "True",
+    train_data_loc = os.getenv("TRAINING_DATA_LOCATION"),
+    eval_data_loc= os.getenv("EVALUATION_DATA_LOCATION"),
+    scaling_info_loc = os.getenv("SCALING_INFO_LOCATION"),
+    save_processed_data = os.getenv("SAVE_DATA_AFTER_PROCESSING", "False") == "True",
 )
 
 breakpoint()
