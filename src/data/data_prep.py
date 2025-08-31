@@ -41,14 +41,14 @@ def prepare_data(
         
         data = __add_estimated_growth(data)
 
-        data = __add_demand_dynamics(data)
+        data = __add_demand_dynamics(data, group_cols = group_cols)
 
         data = __add_previous_run_info(data)
         
         print("Adding product dynamics - this may take a while...")
         data = __add_product_dynamics(data)
         
-        print("Transforming for training...")
+        print("Product dynamics added, transforming for training...")
         data = __transform_for_training(data, target_col = target_col, group_cols = group_cols)
 
         train_data, eval_data = __train_eval_split(data)
@@ -61,13 +61,7 @@ def prepare_data(
         
         train_data = __address_high_cardinality(train_data)
         
-        print("Data processing complete")
-
-        if save_processed_data:
-            train_data.write_parquet(train_data_loc)
-            eval_data.write_parquet(eval_data_loc)
-            scaling_info.write_parquet(scaling_info_loc)
-            print(f"Processed data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
+        print("Data processing complete!")
 
     finally:
         # Update target and group col names after transform
@@ -77,8 +71,14 @@ def prepare_data(
         __test_data(eval_data, data_name = "eval_data", group_cols = index_cols)
         
         __test_data(scaling_info, data_name = "scaling_info", group_cols = ["feature"])
+        
+        if save_processed_data and not load_processed_data:
+            train_data.write_parquet(train_data_loc)
+            eval_data.write_parquet(eval_data_loc)
+            scaling_info.write_parquet(scaling_info_loc)
+            print(f"Processed data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
 
-        target_col = f"{target_col}_target"
+        target_col = f"{target_col}_target_bool"
         train_data = __seperate_dependent_variable(train_data, target = target_col) 
         eval_data = __seperate_dependent_variable(eval_data, target = target_col) 
         return train_data, eval_data, scaling_info
@@ -175,12 +175,21 @@ Add derivatives of demand and growth
 We don't need to do this for revenue since price is constant during a catalogue run, so revenue dynamics are the same as sales dynamics
 """
 def __add_demand_dynamics(
-    data: pl.DataFrame
+    data: pl.DataFrame,
+    group_cols: list,
 ) -> pl.DataFrame:
     return data.with_columns(
-        pl.col("actual_completed_sales_weekly").diff().alias("change_actual_completed_sales_weekly"),
-        pl.col("forecasted_remaining_sales_weekly").diff().alias("change_forecasted_remaining_sales_weekly"),
-        pl.col("estimated_growth_sales_weekly").diff().alias("change_estimated_growth_sales_weekly"),
+        (
+            pl.col("actual_completed_sales_weekly").diff().over(group_cols).fill_null(0.0)
+        ).alias("change_actual_completed_sales_weekly"),
+
+        (
+            pl.col("forecasted_remaining_sales_weekly").diff().over(group_cols).fill_null(0.0)
+        ).alias("change_forecasted_remaining_sales_weekly"),
+
+        ( 
+            pl.col("estimated_growth_sales_weekly").diff().over(group_cols).fill_null(0.0)
+        ).alias("change_estimated_growth_sales_weekly"),
     )
 
 """
@@ -354,31 +363,40 @@ def __add_sales_info(
 Add volatility measures based on forecasted and actual sales history
 """
 def __add_volatility_measures(
-        product_run_info: pl.DataFrame,
-        measure: str = "cv",
-    ) -> pl.DataFrame:
-        if measure == "std":
-            product_run_info = product_run_info.with_columns(
-                # Volatility of actual sales so far
-                pl.col("actual_completed_sales_weekly").list.std().alias("std_actual_completed_sales"),
+    product_run_info: pl.DataFrame,
+    measure: str = "cv",
+    volatility_cap: int = 10,
+) -> pl.DataFrame:
+    # Standard deviation (std)
+    if measure == "std":
+        product_run_info = product_run_info.with_columns(
+            # Volatility of actual sales so far
+            pl.col("actual_completed_sales_weekly").list.std().alias("std_actual_completed_sales"),
 
-                # Volatility of forecasted sales so far
-                pl.col("forecasted_remaining_sales_weekly").list.std().alias("std_forecasted_remaining_sales"),
-            )
-        
-        elif measure == "cv":
-            product_run_info = product_run_info.with_columns(
-                # Standard deviation relative to mean: coefficient of variation (cv)
-                (pl.col("forecasted_remaining_sales_weekly").list.std() / pl.col("forecasted_remaining_sales_weekly").list.mean()).alias("cv_forecasted_remaining_sales"),
-                (pl.col("actual_completed_sales_weekly").list.std() / pl.col("actual_completed_sales_weekly").list.mean()).alias("cv_actual_completed_sales"),
-            )
+            # Volatility of forecasted sales so far
+            pl.col("forecasted_remaining_sales_weekly").list.std().alias("std_forecasted_remaining_sales"),
+        )
+    
+    # Standard deviation relative to mean: coefficient of variation (cv)
+    elif measure == "cv":
+        product_run_info = product_run_info.with_columns(
+            (
+                (
+                    pl.col("forecasted_remaining_sales_weekly").list.std() / pl.col("forecasted_remaining_sales_weekly")
+                ).list.mean().fill_null(0.0).clip(0.0, volatility_cap)
+            ).alias("cv_forecasted_remaining_sales"),
 
-        else:
-            raise ValueError(f"Unknown volatility measure: {measure}")
-        
-        
+            (
+                (
+                    pl.col("actual_completed_sales_weekly").list.std() / pl.col("actual_completed_sales_weekly")
+                ).list.mean().fill_null(0.0).clip(0.0, volatility_cap)
+            ).alias("cv_actual_completed_sales"),
+        )
 
-        return product_run_info
+    else:
+        raise ValueError(f"Unknown volatility measure: {measure}")
+
+    return product_run_info
 
 """
 Add product status features that are dependent on weeks_out features - how long since the product's range_out status last changed, and how many times it has changed
@@ -603,22 +621,27 @@ def __transform_for_training(
     group_cols: list,
 ):
     # Make clear which columns aren't features
-    data_rename_map = {
-        target_col: f"{target_col}_target",
-    }
+    data_rename_map = {}
     
     [data_rename_map.update({col: f"{col}_group"}) for col in group_cols]
+    
+    # Indicate which 0/1 cols are meant to be bools
+    bool_cols = [col for col in data.columns if data[col].dtype == pl.Boolean]
+    [data_rename_map.update({col: f"{col}_bool"}) for col in bool_cols]
+    
+    # Override target col rename
+    data_rename_map[target_col] = f"{target_col}_target_bool"    
 
     data = data.rename(data_rename_map)
 
     # Cast all booleans to 0/1 UInt8 integers
-    bool_cols = [col for col in data.columns if data[col].dtype == pl.Boolean]
     data = data.with_columns(
         [
-            pl.col(col).cast(pl.UInt8).alias(f"{col}_bool")
+            pl.col(data_rename_map[col]).cast(pl.UInt8)
         for col in bool_cols]
     )
-
+    
+    
     return data
 
 """
@@ -740,33 +763,33 @@ def __test_data(
     )
 
     if not data_missing.is_empty():
-        # For each null row, get which columns are null
-        data_missing = data_missing.with_columns( 
-            cols_with_missing = pl.concat_list(
-                *[
-                    pl.when(
-                        pl.col(col).is_null()
-                    ).then(pl.lit(col)).otherwise(pl.lit(None))
-                for col in data.columns]
-            ).alias("cols_with_missing")
-        )
+        __raise_data_error(data_missing)
 
-        # Get identifying info for each missing row
-        identifying_info = data_missing.select(
-            pl.col(group_cols).cast(pl.Utf8)
-            ).sort(group_cols[::-1])
+"""
+Raise data error with details of null rows
+"""
+def __raise_data_error(
+    data_missing: pl.DataFrame,
+):
+    # For each null row, get which columns are null
+    data_missing = data_missing.with_columns( 
+        cols_with_missing = pl.concat_list(
+            *[
+                pl.when(
+                    pl.col(col).is_null()
+                ).then(pl.lit(col)).otherwise(pl.lit(None))
+            for col in data.columns]
+        ).alias("cols_with_missing")
+    )
 
-        n_missing = data_missing.height
-        missing_cols = data_missing.select(
-            pl.col("cols_with_missing").explode().unique().drop_nulls()
-        ).to_series().to_list()
+    # Get identifying info for each missing row
+    identifying_info = data_missing.select(
+        pl.col(group_cols).cast(pl.Utf8)
+        ).sort(group_cols[::-1])
 
-        raise ValueError(f"{data_name} has {n_missing} rows with missing values \n\n Columns containing NaN/null: {missing_cols} \n\n Row indexes containin NaN/null: {identifying_info}")
+    n_missing = data_missing.height
+    missing_cols = data_missing.select(
+        pl.col("cols_with_missing").explode().unique().drop_nulls()
+    ).to_series().to_list()
 
-
-
-
-
-
-
-
+    raise ValueError(f"{data_name} has {n_missing} rows with missing values \n\n Columns containing NaN/null: {missing_cols} \n\n Row indexes containin NaN/null: {identifying_info}")
