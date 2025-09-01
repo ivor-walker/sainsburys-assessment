@@ -3,8 +3,10 @@ Model - sets encapsulated model, and provides generic public methods to interact
 """
 from src.models.glmm import GLMm
 from src.models.lightgbm import LightGBM
+from src.models.mlp import MLP
 
 class Model:
+
     """
     Constructor: attempt to fetch and set encapsulated model
     """
@@ -12,14 +14,20 @@ class Model:
         model_type: str, 
         model_name: str = None,
     ):
-        if model_type == "inference":
+        if model_type == "linear":
             name_model_dict = {
                 "GLMm": GLMm,
             }
-        elif model_type == "prediction":
+        elif model_type == "tree":
             name_model_dict = {
                 "LightGBM": LightGBM,
             }
+        
+        elif model_type == "nn":
+            name_model_dict = {
+                "GatedMultiHeadMLP": MLP,
+            }
+
         else:
             raise ValueError(f"Model type {model_type} is not supported.")
         

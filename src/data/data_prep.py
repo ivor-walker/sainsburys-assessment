@@ -5,12 +5,12 @@ Data preprocessing functions
 import polars as pl
 
 """
-Final pipeline to be imported by inference
+Final pipeline to be imported by inference (main)
 """
 def prepare_data(
     target_col: str = "discontinued",
     group_cols: list = ["product", "catalogue"],
-    sort_order: list = ["product", "catalogue", "weeks_out"],
+    sort_order: list = ["product_group", "catalogue_group", "weeks_out"],
     use_training_info: bool = True,
     **kwargs
 ) -> tuple:
@@ -32,25 +32,29 @@ def prepare_data(
             print(str(e))
             raise Exception("Categorical info failed to load - this file is required for performing inference on new data.")
     
-    processed_data_loc = kwargs["processed_data_loc"]
-    load_processed_data = kwargs["load_processed_data"] 
-    
+    load_processed_data = kwargs["load_processed_data"]
+
     try:
         if not load_processed_data:
-            raise Exception("Loading processed data disabled in environment variables")
-        
+            raise Exception("Loading processed data disabled")
+
         print("Loading processed data from disk...")
+        processed_data_loc = kwargs["processed_data_loc"]
         data = pl.read_parquet(processed_data_loc)
+
         print("Processed data loaded successfully!")
         
     except Exception as e:
         print(str(e))
         load_processed_data = False
+
+    if not load_processed_data:
         print("Reading and processing raw data...")
 
         data = __read_data(kwargs["product_details"], kwargs["catalogue_discontinuation"]) 
 
-        data = __clean_data(data, sort_order = sort_order)
+        data = __clean_data(data, sort_order = sort_order, target_col = target_col, group_cols = group_cols)
+        group_cols = [f"{col}_group" for col in group_cols]
 
         data = __add_logs(data)
         
@@ -66,33 +70,33 @@ def prepare_data(
         print("Adding product dynamics - this may take a while...")
         data = __add_product_dynamics(data)
         
-        print("Product dynamics added, transforming for training...")
-        
         if use_training_info:
             __test_data(scaling_info, data_name = "scaling_info", index_cols = [])
-            data = __apply_scaling_info(data, scaling_info)
+            data = __apply_scaling(data, scaling_info)
 
             __test_data(categorical_info, data_name = "categorical_info", index_cols = [])
             data = __apply_categorical_info(data, categorical_info)
 
-        data = __transform_for_training(data, target_col = target_col, group_cols = group_cols)
+            print("Product dynamics added, transforming for training - this process is highly memory intensive...")
+            data = __transform_for_training(data, group_cols = group_cols)
+            print("Data transformed for inference")
 
-    finally:
-        print("Finalising processed data...")
-        __test_data(data, data_name = "processed_data", index_cols = sort_order)
+    print("Finalising processed data...")
+    __test_data(data, data_name = "processed_data", index_cols = sort_order)
         
-        save_processed_data = kwargs["save_processed_data"]
-        if save_processed_data and not load_processed_data:
-            data.write_parquet(processed_data_loc)
+    save_processed_data = kwargs["save_processed_data"]
+    if save_processed_data and not load_processed_data and use_training_info:
+        processed_data_loc = kwargs["processed_data_loc"]
+        data.write_parquet(processed_data_loc)
 
-            print(f"Processed data saved to {processed_data_loc}") 
+        print(f"Processed data saved to {processed_data_loc}") 
         
-        if use_training_info:
-            target_col = f"{target_col}_target_bool"
-            data = __seperate_dependent_variable(data, target = target_col)
+    if use_training_info:
+        target_col = f"{target_col}_target_bool"
+        data = __seperate_dependent_variable(data, target = target_col)
 
-        print("Data processing complete!")
-        return data, scaling_info
+    print("Data processing complete!")
+    return data, scaling_info
 
 """
 Final pipeline to be used for training
@@ -106,7 +110,8 @@ def prepare_training_data(
     train_data_loc = kwargs["train_data_loc"]
     eval_data_loc = kwargs["eval_data_loc"]
     scaling_info_loc = kwargs["scaling_info_loc"]
-    
+    categorical_info_loc = kwargs["categorical_info_loc"] 
+
     load_training_data = kwargs["load_training_data"]
 
     try:
@@ -114,52 +119,57 @@ def prepare_training_data(
             raise Exception("Loading training data disabled in environment variables")
         
         print("Loading training data from disk...")
+
         train_data = pl.read_parquet(train_data_loc)
         eval_data = pl.read_parquet(eval_data_loc)
         scaling_info = pl.read_parquet(scaling_info_loc)
+        categorical_info = pl.read_parquet(categorical_info_loc)
+
         print("Training data loaded successfully!")
 
     except Exception as e:
         print(str(e))
         load_training_data = False
-        
+    
+    if not load_training_data:
         print("Creating training data...")
-        data, scaling_info = prepare_data(**kwargs, use_training_info = False)
+        data, scaling_info = prepare_data(**kwargs, use_training_info = False, load_processed_data = False, save_processed_data = False)
+        train_data, eval_data = __train_eval_split(data, split_col = "catalogue_group", eval_data_size = 0.2)
+        del data 
 
-        train_data, eval_data = __train_eval_split(data)
-        
         # Get scaling info from train_dataing data, and apply to both train_data and eval_data
         scaling_info = __get_scaling_info(train_data)
-        
         train_data = __apply_scaling(train_data, scaling_info)
         eval_data = __apply_scaling(eval_data, scaling_info)
         
+        # Get categorical info from train_dataing data, and apply to both train_data and eval_data
         categorical_info = __get_categorical_info(train_data)
-
         train_data = __apply_categorical_info(train_data, categorical_info)
         eval_data = __apply_categorical_info(train_data, categorical_info)
-
-        # train_data = __address_high_cardinality(train_data)
-    
-    finally:
-        print("Finalising training data...")
-        # Update target and group col names after transform
-        sort_order = ["product_group", "catalogue_group", "weeks_out"]
-
-        __test_data(train_data, data_name = "train_data", index_cols = sort_order)
-        __test_data(eval_data, data_name = "eval_data", index_cols = sort_order)
         
-        if kwargs["save_training_data"] and not load_training_data:
-            train_data.write_parquet(train_data_loc)
-            eval_data.write_parquet(eval_data_loc)
-            scaling_info.write_parquet(scaling_info_loc)
-            print(f"Training, eval and scaling data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
+        print("Product dynamics added, transforming for training - this process is highly memory intensive...")
+        train_data = __transform_for_training(train_data, group_cols = group_cols)
+        eval_data = __transform_for_training(eval_data, group_cols = group_cols)
 
-        target_col = f"{target_col}_target_bool"
-        train_data = __seperate_dependent_variable(train_data, target = target_col) 
-        eval_data = __seperate_dependent_variable(eval_data, target = target_col) 
-        print("Training data processing complete!")
-        return train_data, eval_data, scaling_info
+        print("Training data created!")
+        
+    print("Finalising training data...")
+
+    __test_data(train_data, data_name = "train_data", index_cols = sort_order)
+    __test_data(eval_data, data_name = "eval_data", index_cols = sort_order)
+        
+    if kwargs["save_training_data"] and not load_training_data:
+        train_data.write_parquet(train_data_loc)
+        eval_data.write_parquet(eval_data_loc)
+        scaling_info.write_parquet(scaling_info_loc)
+        categorical_info.write_parquet(categorical_info_loc)
+        print(f"Training, eval and scaling data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
+
+    target_col = f"{target_col}_target_bool"
+    train_data = __seperate_dependent_variable(train_data, target = target_col) 
+    eval_data = __seperate_dependent_variable(eval_data, target = target_col) 
+    print("Training data processing complete!")
+    return train_data, eval_data, scaling_info
 
 
 """
@@ -188,6 +198,8 @@ Clean data by recasting columns, renaming, etc
 def __clean_data(
     data: pl.DataFrame,
     sort_order: list,
+    target_col: str,
+    group_cols: list,
 ) -> pl.DataFrame:
     data = data.select(
         # Recast ProductKey, CatEdition, Supplier, Hierarchy to categorical
@@ -220,7 +232,14 @@ def __clean_data(
         # Leave target variable DiscontinuedTF unchanged
         pl.col("DiscontinuedTF").alias("discontinued")
     )
+    
+    # Make clear which columns aren't features
+    data_rename_map = {}
+    [data_rename_map.update({col: f"{col}_group"}) for col in group_cols]
+    data_rename_map[target_col] = f"{target_col}_target"
 
+    data = data.rename(data_rename_map)
+    
     # Return sorted by product, catalogue, weeks_out reversed (latest week first)
     return data.sort(sort_order, descending = [False, False, True])
 
@@ -281,8 +300,6 @@ def __add_demand_dynamics(
         (
             pl.col("log_estimated_growth_sales_weekly").diff().over(group_cols).fill_null(0.0)
         ).alias("log_change_estimated_growth_sales_weekly"),
-
-        
     )
 
 """
@@ -344,7 +361,7 @@ def __add_product_dynamics(
         product_run_info = __check_accuracy_easy_predictions(product_run_info) 
 
     # Join this extra product info onto original weekly data
-    on_cols = ["product", "catalogue", "weeks_out"]
+    on_cols = ["product_group", "catalogue_group", "weeks_out"]
     drop_cols = [col for col in product_run_info.columns if col in data.columns and col not in on_cols]
     return data.join(
         product_run_info.drop(drop_cols),
@@ -593,7 +610,7 @@ def __add_previous_run_info(
 ) -> pl.DataFrame:
     return data.with_columns(     
         # Check in how many other catalogues this product appears in
-        ((pl.col("catalogue").n_unique().over("product")).cast(pl.UInt8) - 1).alias("catalogue_count"),
+        ((pl.col("catalogue_group").n_unique().over("product_group")).cast(pl.UInt8) - 1).alias("catalogue_count"),
     )
 
 """
@@ -602,8 +619,8 @@ Because we're predicting for an unseen product in an unseen catalogue, we withho
 """
 def __train_eval_split(
     data: pl.DataFrame,
-    split_col: str = "catalogue_group",
-    eval_data_size: float = 0.2
+    split_col: str,
+    eval_data_size: float,
 ) -> tuple:
     
     # Get eval catalogue IDs
@@ -633,26 +650,22 @@ def get_sample_products(
     data,
     n: int = 50,
     target_balance: float = 0.5,
-    requested_catalogue = "90"
+    target_col: str = "discontinued_target_bool",
+    merging_cols: list = ["product_group", "catalogue_group"],
 ) -> pl.DataFrame:
     # Get balanced sample
     n_positive_samples = round(n * target_balance)
     n_negative_samples = n - n_positive_samples
     
-    # TODO refactor to avoid filtering all data
-    positive_data = data.filter(pl.col("discontinued") == True)
-    negative_data = data.filter(pl.col("discontinued") == False)
-    if requested_catalogue:
-        positive_data = positive_data.filter(pl.col("catalogue") == requested_catalogue)
-        negative_data = negative_data.filter(pl.col("catalogue") == requested_catalogue)
-
+    positive_data = data.filter(pl.col(target_col) == True)
+    negative_data = data.filter(pl.col(target_col) == False)
+    
     positive_samples = positive_data.sample(n = n_positive_samples)
     negative_samples = negative_data.sample(n = n_negative_samples)
     
     sample = pl.concat([positive_samples, negative_samples])
 
     # Fetch all weekly info from the specific product and catalogue pairs that appear in the sample
-    merging_cols = ["product", "catalogue"]
     weekly_sample = data.join(
         sample.select(merging_cols),
         on = merging_cols,
@@ -666,11 +679,12 @@ Group data by product and aggregate weekly info into arrays to produce a product
 """
 def get_product_aggregate(
     data, 
+    product_columns: list = ["product_group", "catalogue_group", "domestic_bool", "seasonal_bool", "price", "catalogue_count", "start_runtime"]
 ) -> pl.DataFrame:
-    by_week_columns = [col_name for col_name in data.columns if "week" in col_name]
-    product_columns = [col_name for col_name in data.columns if col_name not in by_week_columns]
+    by_week_columns = [col_name for col_name in data.columns if "target" not in col_name and ("_is_" not in col_name or "week" in col_name) and col_name not in product_columns]
+    inv_by_week_columns = [col for col in data.columns if col not in by_week_columns]
 
-    return data.group_by(product_columns).agg(by_week_columns)
+    return data.group_by(inv_by_week_columns).agg(by_week_columns)
 
 """
 Get cumulative lists of weekly data for each product up to the current week
@@ -718,25 +732,14 @@ Prepare data in train_dataing format - converting booleans, etc
 """
 def __transform_for_training(
     data: pl.DataFrame,
-    target_col: str,
-    group_cols: list,
+    group_cols: list, 
 ):
-    # Make clear which columns aren't features
+    # Indicate which 0/1 cols are meant to be bools (all)
     data_rename_map = {}
-    
-    [data_rename_map.update({col: f"{col}_group"}) for col in group_cols]
-    
-    # Indicate which 0/1 cols are meant to be bools
     bool_cols = [col for col in data.columns if data[col].dtype == pl.Boolean]
     [data_rename_map.update({col: f"{col}_bool"}) for col in bool_cols]
     
-    # Override target col rename
-    data_rename_map[target_col] = f"{target_col}_target_bool"    
-
     data = data.rename(data_rename_map)
-
-    # Convert categoricals to dummies
-    data = data.to_dummies()
 
     # Cast all booleans to 0/1 UInt8 integers
     data = data.with_columns(
@@ -745,7 +748,26 @@ def __transform_for_training(
         for col in bool_cols]
     )
     
-    
+    # Convert categoricals to dummies
+    cat_cols = [col for col in data.columns if data[col].dtype == pl.Categorical and "group" not in col]
+
+    data = data.to_dummies(columns = cat_cols, separator = "_is_")
+    # Use other_unknown as the base level to avoid perfect collinearity
+    data = data.drop(
+        [col for col in data.columns if "other_unknown" in col]
+    )
+
+    # Drop redundant log columns
+    data = data.drop([
+        "log_actual_completed_sales_weekly", 
+        "log_forecasted_remaining_sales_weekly",
+        "log_average_cumsum_actual_completed_sales",
+        "log_cumsum_actual_completed_sales",
+    ])
+
+    # Drop weeks_in, collinear with weeks_out
+    data = data.drop("weeks_in")
+
     return data
 
 """
@@ -797,10 +819,14 @@ def __apply_scaling(
         if scaling_method == "z_score":
             mean, std = row["mean_stat"], max(row["std_stat"], 1e-6)
             
-            data[feature_name] = (data[feature_name] - mean) / std
-
+            data = data.with_columns(
+                (pl.col(feature_name) - mean) / std
+            )
+            
             if clipping:
-                data[feature_name] = data[feature_name].clip(clip[0], clip[1])
+                data = data.with_columns(
+                    pl.col(feature_name).clip(clip[0], clip[1])
+                )
             
         else:
             raise ValueError(f"Unknown scaling method: {scaling_method}")
@@ -821,7 +847,9 @@ def undo_scaling(
         if scaling_method == "z_score":
             mean, std = row["mean_stat"], max(row["std_stat"], 1e-6)
             
-            data[feature_name] = data[feature_name] * std + mean            
+            data = data.with_columns(
+                (pl.col(feature_name) * std) + mean
+            )
 
         else:
             raise ValueError(f"Unknown scaling method: {scaling_method}") 
@@ -830,17 +858,23 @@ def undo_scaling(
 
 """
 Low frequency categorical variables can cause data leakage, e.g. if a product appears once and its supplier is unique to it, the model can learn to associate that supplier with discontinuation
-To avoid data leakage and reduce cardinality in categorical columns, form distribution of counts and categorical values, and only keep 95% of rows and bin the rest as 'other/unknown'
+To avoid data leakage and reduce cardinality in categorical columns, form distribution of counts and categorical values, and only keep some proportion (rare_category_threshold) of rows and bin the rest as 'other/unknown'
 """
-
-def __address_high_cardinality(
+def __get_categorical_info(
     data: pl.DataFrame,
-    small_supplier_threshold: float = 0.05,
     other_unknown_label: str = "other_unknown",
 ) -> pl.DataFrame:
-    
+
+    rare_category_thresholds = {
+        "supplier": 0.7,
+        "broad_category": 0.95,
+        "specific_category": 0.95,
+    }
+
     # Do not perform this process on grouping cols
     cat_cols = [col for col in data.columns if data[col].dtype == pl.Categorical and "group" not in col and "target" not in col]
+
+    category_levels = {}
     
     for col in cat_cols:
         value_counts = data[col].value_counts().sort("count", descending = True)
@@ -854,24 +888,52 @@ def __address_high_cardinality(
             pl.col("proportion").cum_sum().alias("cumulative_proportion")
         )
 
-        # Keep right hand side of values distribution - i.e. those that make up (1 - m)% of data
-        values_to_keep = value_counts.filter(pl.col("cumulative_proportion") <= (1 - small_supplier_threshold))[col].to_list()
-        
+        # Keep right hand side of values distribution - i.e. those that sum to (1 - m)% of data
+        rare_category_threshold = rare_category_thresholds[col]
+        values_to_keep = value_counts.filter(
+            pl.col("cumulative_proportion") <= rare_category_threshold
+        )[col].to_list()
+
+        category_levels[col] = values_to_keep
+    
+    return pl.DataFrame({
+        "column": list(category_levels.keys()),
+        "values_to_keep": list(category_levels.values()),
+    })
+
+"""
+Apply a given categorical mapping to categorical columns
+"""
+def __apply_categorical_info(
+    data: pl.DataFrame,
+    categorical_info: pl.DataFrame,
+    other_unknown_label: str = "other_unknown",
+) -> pl.DataFrame:
+    cat_cols = [col for col in data.columns if data[col].dtype == pl.Categorical and "group" not in col and "target" not in col]
+
+    for col in cat_cols:
         # Replace values not in values_to_keep with other_unknown_label
+        values_to_keep = categorical_info.filter(
+            pl.col("column") == col
+        )["values_to_keep"][0]
         keep_category = pl.col(col).cast(pl.Utf8).is_in(values_to_keep)
 
         data = data.with_columns(
-            pl.when(keep_category)
-              .then(pl.col(col))
-              .otherwise(pl.lit(other_unknown_label))
-              .cast(pl.Categorical)
-              .alias(col)
+            pl.when(
+                keep_category
+            ).then(
+                pl.col(col)
+            ).otherwise(
+                pl.lit(other_unknown_label)
+            ).cast(
+                pl.Categorical
+            ).alias(col)
         )
 
     return data
 
 """
-Basic tests on test/train to ensure they meet expectations
+Basic tests on any dataframe to ensure they meet expectations
 """
 def __test_data(
     data: pl.DataFrame,
