@@ -6,7 +6,7 @@ Solution to the Sainsbury's Nectar360 Data Science team's challenge.
 By default, the solution looks for data in the data/ directory - please ensure the CatalogueDiscontinuation.csv and ProductDetails.csv files are present. Alternate locations and file names can be specified in the .env file.
 
 ### Running the code
-To train the model, run train.py. To make predictions on new data, run predict.py - although this does not currently produce proper predictions, see the Results section below.
+To train the model, run train.py. To make predictions on new data, run predict.py - although this does not currently produce proper predictions, see the Conclusion section below.
 
 # Methodology
 ## Modelling
