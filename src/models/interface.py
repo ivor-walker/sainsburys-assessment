@@ -9,7 +9,7 @@ class InterfaceModel(ABC):
         pass
 
     @abstractmethod
-    def train(self, data):
+    def train(self, train_data, eval_data):
         pass
 
     @abstractmethod

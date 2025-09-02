@@ -12,6 +12,7 @@ def prepare_data(
     group_cols: list = ["product", "catalogue"],
     sort_order: list = ["product_group", "catalogue_group", "weeks_out"],
     use_training_info: bool = True,
+    proportion_to_use: float = 1.0,
     **kwargs
 ) -> tuple:
     
@@ -55,6 +56,10 @@ def prepare_data(
 
         data = __clean_data(data, sort_order = sort_order, target_col = target_col, group_cols = group_cols)
         group_cols = [f"{col}_group" for col in group_cols]
+        target_col = f"{target_col}_target"
+        
+        n_unique_runs = round(data["product_group"].n_unique() * proportion_to_use)
+        data = get_sample_products(data, balance = False, n = n_unique_runs, target_col = f"{target_col}_bool", merging_cols = group_cols)
 
         data = __add_logs(data)
         
@@ -70,15 +75,18 @@ def prepare_data(
         print("Adding product dynamics - this may take a while...")
         data = __add_product_dynamics(data)
         
+        data = __remove_problematic_columns(data)
+
         if use_training_info:
             __test_data(scaling_info, data_name = "scaling_info", index_cols = [])
             data = __apply_scaling(data, scaling_info)
 
             __test_data(categorical_info, data_name = "categorical_info", index_cols = [])
             data = __apply_categorical_info(data, categorical_info)
-
+            
             print("Product dynamics added, transforming for training - this process is highly memory intensive...")
             data = __transform_for_training(data, group_cols = group_cols)
+
             print("Data transformed for inference")
 
     print("Finalising processed data...")
@@ -105,10 +113,12 @@ def prepare_training_data(
     target_col: str = "discontinued",
     group_cols: list = ["product", "catalogue"],
     sort_order: list = ["product", "catalogue", "weeks_out"],
+    proportion_to_use: float = 0.05,
     **kwargs,
 ):
     train_data_loc = kwargs["train_data_loc"]
     eval_data_loc = kwargs["eval_data_loc"]
+    test_data_loc = kwargs["test_data_loc"]
     scaling_info_loc = kwargs["scaling_info_loc"]
     categorical_info_loc = kwargs["categorical_info_loc"] 
 
@@ -122,6 +132,7 @@ def prepare_training_data(
 
         train_data = pl.read_parquet(train_data_loc)
         eval_data = pl.read_parquet(eval_data_loc)
+        test_data = pl.read_parquet(test_data_loc)
         scaling_info = pl.read_parquet(scaling_info_loc)
         categorical_info = pl.read_parquet(categorical_info_loc)
 
@@ -133,23 +144,30 @@ def prepare_training_data(
     
     if not load_training_data:
         print("Creating training data...")
-        data, scaling_info = prepare_data(**kwargs, use_training_info = False, load_processed_data = False, save_processed_data = False)
-        train_data, eval_data = __train_eval_split(data, split_col = "catalogue_group", eval_data_size = 0.2)
+        if not kwargs["train_on_sample"]:
+            proportion_to_use = 1.0
+
+        data, scaling_info = prepare_data(**kwargs, use_training_info = False, load_processed_data = False, save_processed_data = False, proportion_to_use = proportion_to_use)
+        
+        train_data, eval_data, test_data = __train_eval_test_split(data, split_col = "catalogue_group", eval_data_size = 0.1, test_data_size = 0.1)
         del data 
 
         # Get scaling info from train_dataing data, and apply to both train_data and eval_data
         scaling_info = __get_scaling_info(train_data)
         train_data = __apply_scaling(train_data, scaling_info)
         eval_data = __apply_scaling(eval_data, scaling_info)
-        
+        test_data = __apply_scaling(test_data, scaling_info) 
+
         # Get categorical info from train_dataing data, and apply to both train_data and eval_data
         categorical_info = __get_categorical_info(train_data)
         train_data = __apply_categorical_info(train_data, categorical_info)
         eval_data = __apply_categorical_info(train_data, categorical_info)
-        
+        test_data = __apply_categorical_info(test_data, categorical_info) 
+
         print("Product dynamics added, transforming for training - this process is highly memory intensive...")
         train_data = __transform_for_training(train_data, group_cols = group_cols)
         eval_data = __transform_for_training(eval_data, group_cols = group_cols)
+        test_data = __transform_for_training(test_data, group_cols = group_cols)
 
         print("Training data created!")
         
@@ -157,19 +175,21 @@ def prepare_training_data(
 
     __test_data(train_data, data_name = "train_data", index_cols = sort_order)
     __test_data(eval_data, data_name = "eval_data", index_cols = sort_order)
-        
+    __test_data(scaling_info, data_name = "scaling_info", index_cols = [])
+
     if kwargs["save_training_data"] and not load_training_data:
         train_data.write_parquet(train_data_loc)
         eval_data.write_parquet(eval_data_loc)
+        test_data.write_parquet(test_data_loc)
         scaling_info.write_parquet(scaling_info_loc)
         categorical_info.write_parquet(categorical_info_loc)
-        print(f"Training, eval and scaling data saved to {train_data_loc}, {eval_data_loc}, {scaling_info_loc}")
+        print(f"Training, eval, test and scaling data saved to {train_data_loc}, {eval_data_loc}, {test_data_loc}, {scaling_info_loc}")
 
     target_col = f"{target_col}_target_bool"
     train_data = __seperate_dependent_variable(train_data, target = target_col) 
     eval_data = __seperate_dependent_variable(eval_data, target = target_col) 
     print("Training data processing complete!")
-    return train_data, eval_data, scaling_info
+    return train_data, eval_data, test_data, scaling_info
 
 
 """
@@ -601,7 +621,7 @@ def __add_weeks_out_info(
 
         return product_run_info
 
-
+# TODO add more previous catalogue info
 """
 Add info on previous appearances of the product in earlier catalogues as this affects discontinuation status - products that have appeared in many previous catalogues but have consistent non-discontinued status can be discontinued
 """
@@ -617,22 +637,29 @@ def __add_previous_run_info(
 Split data into train_data and eval_data sets
 Because we're predicting for an unseen product in an unseen catalogue, we withhold 20% of newest catalogues for eval 
 """
-def __train_eval_split(
+def __train_eval_test_split(
     data: pl.DataFrame,
     split_col: str,
     eval_data_size: float,
+    test_data_size: float,
 ) -> tuple:
     
     # Get eval catalogue IDs
     catalogues = data[split_col].unique().sort()
     n_eval_catalogues = round(len(catalogues) * eval_data_size)
-    eval_catalogues = catalogues.tail(n_eval_catalogues)
+    n_test_catalogues = round(len(catalogues) * eval_data_size)
+    n_train_catalogues = len(catalogues) - n_eval_catalogues - n_test_catalogues
+
+    train_catalogues = catalogues[:n_train_catalogues]
+    eval_catalogues = catalogues[n_train_catalogues:n_train_catalogues + n_eval_catalogues]
+    test_catalogues = catalogues[n_train_catalogues + n_eval_catalogues:]
 
     # Split data into train_data and eval_data sets
-    train_data = data.filter(~pl.col(split_col).is_in(eval_catalogues))
+    train_data = data.filter(pl.col(split_col).is_in(train_catalogues))
     eval_data = data.filter(pl.col(split_col).is_in(eval_catalogues))
+    test_data = data.filter(pl.col(split_col).is_in(test_catalogues))
 
-    return train_data, eval_data
+    return train_data, eval_data, test_data
 
 """
 Separate dependent variable from features
@@ -644,26 +671,32 @@ def __seperate_dependent_variable(
     return data.drop(target), data.select(pl.col(target))
 
 """
-Select n random products, with a balance of discontinued and not discontinued
+Select n random products, with an optional balance of discontinued and not discontinued
 """
 def get_sample_products(
     data,
     n: int = 50,
+    balance: bool = True,
     target_balance: float = 0.5,
     target_col: str = "discontinued_target_bool",
     merging_cols: list = ["product_group", "catalogue_group"],
 ) -> pl.DataFrame:
     # Get balanced sample
-    n_positive_samples = round(n * target_balance)
-    n_negative_samples = n - n_positive_samples
+    if balance:
+        n_positive_samples = round(n * target_balance)
+        n_negative_samples = n - n_positive_samples
+        
+        positive_data = data.filter(pl.col(target_col) == True)
+        negative_data = data.filter(pl.col(target_col) == False)
+        
+        positive_samples = positive_data.sample(n = n_positive_samples)
+        negative_samples = negative_data.sample(n = n_negative_samples)
+        
+        sample = pl.concat([positive_samples, negative_samples])
     
-    positive_data = data.filter(pl.col(target_col) == True)
-    negative_data = data.filter(pl.col(target_col) == False)
-    
-    positive_samples = positive_data.sample(n = n_positive_samples)
-    negative_samples = negative_data.sample(n = n_negative_samples)
-    
-    sample = pl.concat([positive_samples, negative_samples])
+    # Get unbalanced sample
+    else:
+        sample = data.sample(n = n)
 
     # Fetch all weekly info from the specific product and catalogue pairs that appear in the sample
     weekly_sample = data.join(
@@ -726,6 +759,24 @@ def get_product_cum_aggregate(
     )
 
     return frame.select([*product_columns, *by_week_columns, *cum_cols])
+"""
+Drop some columns that were used to build other features but would create problems if used in training
+"""
+def __remove_problematic_columns(
+    data: pl.DataFrame,
+) -> pl.DataFrame:
+    # Drop redundant log columns
+    data = data.drop([
+        "log_actual_completed_sales_weekly", 
+        "log_forecasted_remaining_sales_weekly",
+        "log_average_cumsum_actual_completed_sales",
+        "log_cumsum_actual_completed_sales",
+    ])
+
+    # Drop weeks_in, collinear with weeks_out
+    data = data.drop("weeks_in")
+    
+    return data
 
 """
 Prepare data in train_dataing format - converting booleans, etc
@@ -757,16 +808,7 @@ def __transform_for_training(
         [col for col in data.columns if "other_unknown" in col]
     )
 
-    # Drop redundant log columns
-    data = data.drop([
-        "log_actual_completed_sales_weekly", 
-        "log_forecasted_remaining_sales_weekly",
-        "log_average_cumsum_actual_completed_sales",
-        "log_cumsum_actual_completed_sales",
-    ])
-
-    # Drop weeks_in, collinear with weeks_out
-    data = data.drop("weeks_in")
+    
 
     return data
 
@@ -1031,3 +1073,18 @@ def __check_data_error(
     identifying_info = problem_data.select(pl.col(index_cols)).sort(index_cols, descending = [False, False, True])
         
     raise ValueError(f"{data_name} has {n_problem} rows with {issue_name} \n\n Columns with issue: {problem_cols} \n\n Rows with issue: {identifying_info}")
+
+"""
+Combine grouping columns into a single group column, as required by some models
+"""
+def combine_grouping_columns(
+    data
+) -> pl.DataFrame:
+    group_cols = [col for col in data.columns if "group" in col]
+    data = data.with_columns(
+        pl.concat_str(group_cols, separator = "_").alias("product_catalogue_group")
+    )
+
+    data = data.drop(group_cols)
+
+    return data
